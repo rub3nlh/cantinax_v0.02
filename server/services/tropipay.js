@@ -21,8 +21,8 @@ class TropiPayService {
     this.tropipaySDK = new Tropipay({
       //clientId: '921f756b0e0b2f223ce9eaa784398c94', //process.env.TROPIPAY_CLIENT_ID,
       //clientSecret: '6ef0063ea113a6c33765b93a43a23e41', //process.env.TROPIPAY_CLIENT_SECRET,
-      clientId: `"`+process.env.TROPIPAY_CLIENT_ID+`"`, //process.env.TROPIPAY_CLIENT_ID,
-      clientSecret: `"`+process.env.TROPIPAY_CLIENT_SECRET+`"`, //process.env.TROPIPAY_CLIENT_SECRET,
+      clientId: process.env.TROPIPAY_CLIENT_ID, //process.env.TROPIPAY_CLIENT_ID,
+      clientSecret: process.env.TROPIPAY_CLIENT_SECRET, //process.env.TROPIPAY_CLIENT_SECRET,
       serverMode: process.env.NODE_ENV === 'production' ? 'Production' : 'Development'
     });
 

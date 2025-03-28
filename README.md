@@ -1,4 +1,4 @@
-# LaCantinaXL - Comida Cubana a Domicilio
+# LaCantinaXL - Comida Cubana a Domicilio v0.021
 
 LaCantinaXL es una plataforma que permite a personas en el extranjero enviar comidas caseras cubanas a sus familiares en Cuba.
 

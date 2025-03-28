@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { PaymentMethod } from '../types';
 import { usePaymentOrders } from './usePaymentOrders';
 import { supabase } from '../lib/supabase';
@@ -30,10 +30,51 @@ interface TropiPayData {
   orderId: string;
 }
 
+// Nombre exacto de la función Edge tal como está configurada en Supabase
+const EDGE_FUNCTION_NAME = 'tropipay-payment';
+
 export function usePayment() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const { createPaymentOrder, updatePaymentOrder } = usePaymentOrders();
+  const [useServerFallback, setUseServerFallback] = useState(false);
+
+  // Verificar si la función Edge está disponible al montar el componente
+  useEffect(() => {
+    const checkEdgeFunction = async () => {
+      try {
+        console.log("Verificando disponibilidad de función Edge:", EDGE_FUNCTION_NAME);
+        
+        // Obtener token de sesión
+        const { data: { session } } = await supabase.auth.getSession();
+        if (!session?.access_token) {
+          console.warn('No hay sesión de usuario disponible, usando servidor Express');
+          setUseServerFallback(true);
+          return;
+        }
+
+        // Comprobar si la función Edge está disponible
+        const { data, error } = await supabase.functions.invoke(EDGE_FUNCTION_NAME, {
+          body: { action: 'check' },
+          headers: {
+            Authorization: `Bearer ${session.access_token}`
+          }
+        });
+
+        if (error) {
+          console.warn(`Función Edge "${EDGE_FUNCTION_NAME}" no disponible:`, error);
+          setUseServerFallback(true);
+        } else {
+          console.log(`Función Edge "${EDGE_FUNCTION_NAME}" disponible:`, data);
+        }
+      } catch (err) {
+        console.warn('Error verificando función Edge, usando servidor Express:', err);
+        setUseServerFallback(true);
+      }
+    };
+
+    checkEdgeFunction();
+  }, []);
 
   const processCardPayment = async (data: CardPaymentData & { orderId: string }) => {
     try {
@@ -45,34 +86,69 @@ export function usePayment() {
         order_id: data.orderId,
         payment_method: 'card',
         amount: data.amount,
-        currency: data.currency || 'USD',
+        currency: 'EUR',
         description: 'Pago con tarjeta'
       });
 
       try {
-         // Use Express backend for card processing
-        const response = await fetch(`${window.location.origin}/api/payments/process-card`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            cardNumber: data.cardNumber,
-            expiryDate: data.expiryDate,
-            cvv: data.cvv,
-            amount: data.amount
-          })
-        });
-        
-        if (!response.ok) {
-          const errorData = await response.json();
-          throw new Error(errorData.error || 'Error procesando el pago');
-        }
+        let functionData;
 
-        const functionData = await response.json();
+        // Preparar payload
+        const payloadData = {
+          cardNumber: data.cardNumber,
+          expiryDate: data.expiryDate,
+          cvv: data.cvv,
+          amount: data.amount
+        };
 
-        if (functionError) {
-          throw new Error(functionError.message || 'Error procesando el pago');
+        if (useServerFallback) {
+          console.log("Procesando pago con tarjeta a través del servidor Express");
+          
+          // Usar el servidor Express como fallback
+          const response = await fetch(`${window.location.origin}/api/payments/process-card`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(payloadData)
+          });
+
+          if (!response.ok) {
+            const errorData = await response.json();
+            throw new Error(errorData.error || 'Error procesando el pago');
+          }
+
+          functionData = await response.json();
+        } else {
+          console.log("Procesando pago con tarjeta a través de función Edge");
+          
+          // Obtener token de sesión para autenticación
+          const { data: { session } } = await supabase.auth.getSession();
+          if (!session?.access_token) {
+            console.warn('No hay sesión de usuario disponible, cambiando a servidor Express');
+            setUseServerFallback(true);
+            
+            // Reintento con Express
+            return processCardPayment(data);
+          }
+
+          // Usar la función Edge, siguiendo exactamente la guía de Supabase
+          const { data: edgeData, error: functionError } = await supabase.functions.invoke(EDGE_FUNCTION_NAME, {
+            body: {
+              action: 'process-card',
+              ...payloadData
+            },
+            headers: {
+              Authorization: `Bearer ${session.access_token}`
+            }
+          });
+
+          if (functionError) {
+            console.error("Error en función Edge:", functionError);
+            throw new Error(functionError.message || 'Error procesando el pago');
+          }
+
+          functionData = edgeData;
         }
 
         if (!functionData) {
@@ -88,11 +164,21 @@ export function usePayment() {
 
         return functionData;
       } catch (err) {
+        console.error("Error en procesamiento de pago:", err);
+        
+        // Si el error es de la función Edge, cambiar a servidor Express para próximos intentos
+        if (!useServerFallback && err instanceof Error && 
+            (err.message.includes('Edge Function') || err.message.includes('Failed to send'))) {
+          console.warn('Cambiando a servidor Express para futuros pagos');
+          setUseServerFallback(true);
+        }
+        
         // Update payment order with error status
         await updatePaymentOrder(paymentOrder.id, {
           status: 'failed',
           error_message: err instanceof Error ? err.message : 'Error procesando el pago'
         });
+        
         throw err;
       }
     } catch (err) {
@@ -119,54 +205,134 @@ export function usePayment() {
       });
 
       try {
-        const response = await fetch(`${window.location.origin}/api/payments/create-payment-link`, {
-        //const response = await fetch(`https://lacantinax-3c315bb3e12b.herokuapp.com/api/payments/create-payment-link`, {
-          
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            reference: data.reference,
-            concept: data.concept,
-            amount: data.amount,
-            currency: data.currency,
-            description: data.description,
-            urlSuccess: data.urlSuccess,
-            urlFailed: data.urlFailed,
-            urlNotification: data.urlNotification,
-            client: data.client
-          })
-        });
+        let paymentResult;
 
-        if (!response.ok) {
-          const errorData = await response.json();
-          throw new Error(errorData.error || 'Error creando link de pago');
+        // Preparar payload para ambos endpoints (servidor y función Edge)
+        const payloadData = {
+          reference: data.reference,
+          concept: data.concept,
+          amount: data.amount,
+          currency: data.currency,
+          description: data.description,
+          urlSuccess: data.urlSuccess,
+          urlFailed: data.urlFailed,
+          urlNotification: data.urlNotification,
+          client: data.client,
+          favorite: false
+        };
+
+        // Decidir si usar el servidor Express o la función Edge
+        if (useServerFallback) {
+          console.log("Creando enlace TropiPay a través del servidor Express");
+          
+          // Usar el servidor Express como fallback
+          const response = await fetch(`${window.location.origin}/api/payments/create-payment-link`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(payloadData)
+          });
+
+          if (!response.ok) {
+            const errorData = await response.json();
+            throw new Error(errorData.error || 'Error creando link de pago');
+          }
+
+          paymentResult = await response.json();
+        } else {
+          console.log("Creando enlace TropiPay a través de función Edge");
+          
+          // Obtener token de sesión para autenticación
+          const { data: { session } } = await supabase.auth.getSession();
+          if (!session?.access_token) {
+            console.warn('No hay sesión de usuario disponible, cambiando a servidor Express');
+            setUseServerFallback(true);
+            
+            // Reintento con Express
+            return createTropiPayLink(data);
+          }
+
+          try {
+            // Llamar a la función Edge siguiendo las recomendaciones de Supabase
+            const { data: edgeData, error: functionError } = await supabase.functions.invoke(EDGE_FUNCTION_NAME, {
+              body: {
+                action: 'create-payment-link',
+                ...payloadData
+              },
+              headers: {
+                Authorization: `Bearer ${session.access_token}`
+              }
+            });
+
+            if (functionError) {
+              console.error("Error en función Edge:", functionError);
+              throw new Error(functionError.message || 'Error creando link de pago');
+            }
+
+            paymentResult = edgeData;
+          } catch (edgeError) {
+            console.warn('Error usando función Edge, cambiando a servidor Express:', edgeError);
+            setUseServerFallback(true);
+            
+            // Reintento con Express como fallback inmediato
+            const response = await fetch(`${window.location.origin}/api/payments/create-payment-link`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(payloadData)
+            });
+
+            if (!response.ok) {
+              const errorData = await response.json();
+              throw new Error(errorData.error || 'Error creando link de pago');
+            }
+
+            paymentResult = await response.json();
+          }
         }
 
-        const paymentResult = await response.json();
+        if (!paymentResult) {
+          throw new Error('No se recibió respuesta del servidor');
+        }
 
-         // Log successful creation for debugging
-        console.log('TropiPay link created successfully:', paymentResult);
+        console.log('Respuesta de TropiPay:', paymentResult);
+
+        // Asegurar que haya una URL corta
+        const shortUrl = paymentResult.shortUrl || 
+                        (paymentResult.hash ? `https://tppay.me/${paymentResult.hash}` : null);
+        
+        if (!shortUrl) {
+          throw new Error('No se pudo generar la URL de pago');
+        }
 
         // Update payment order with payment link data
         await updatePaymentOrder(paymentOrder.id, {
           reference: paymentResult.id || paymentResult._id,
-          short_url: paymentResult.shortUrl || `https://tppay.me/${paymentResult.hash}`
+          short_url: shortUrl
         });
 
         return {
           ...paymentResult,
-          // Ensure shortUrl is available
-          shortUrl: paymentResult.shortUrl || `https://tppay.me/${paymentResult.hash}`
+          shortUrl
         };
-        
       } catch (err) {
+        console.error('Error creating TropiPay link:', err);
+        
+        // Si el error es de la función Edge, cambiar a servidor Express para próximos intentos
+        if (!useServerFallback && err instanceof Error && 
+            (err.message.includes('Edge Function') || err.message.includes('Failed to send'))) {
+          console.warn('Cambiando a servidor Express para futuros pagos');
+          setUseServerFallback(true);
+        }
+        
         // Update payment order with error status
         await updatePaymentOrder(paymentOrder.id, {
           status: 'failed',
           error_message: err instanceof Error ? err.message : 'Error creando link de pago'
         });
+        
         throw err;
       }
     } catch (err) {
